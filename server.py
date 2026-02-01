@@ -49,6 +49,15 @@ from services.analytics_service import AnalyticsService
 # Import modular routes
 from routes.classes_routes import router as classes_router
 
+# Import models
+from models.assessment_models import (
+    AIMultiQuestionRequest,
+    EnhancedAssessmentCreate,
+    EnhancedQuestionCreate,
+    QuestionPartCreate,
+    MCQOptionCreate
+)
+
 # Import OCR service with error handling
 try:
     from ocr_service import ocr_service, OCRResult
