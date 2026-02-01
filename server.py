@@ -9,6 +9,7 @@ import httpx
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict, EmailStr
 from typing import List, Optional
+from contextlib import asynccontextmanager
 import uuid
 from datetime import datetime, timezone, timedelta
 # from emergentintegrations.llm.chat import LlmChat, UserMessage
@@ -165,7 +166,17 @@ def verify_azure_token(token: str):
         logging.error(f"Unexpected error during token verification: {str(e)}")
         raise HTTPException(status_code=401, detail="Token verification failed")
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown events"""
+    # Startup: Connection already established at module level
+    logger.info("Application starting up...")
+    yield
+    # Shutdown
+    logger.info("Application shutting down...")
+    client.close()
+
+app = FastAPI(lifespan=lifespan)
 api_router = APIRouter(prefix="/api")
 
 # Health check endpoint (required for deployment)
@@ -4555,6 +4566,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
