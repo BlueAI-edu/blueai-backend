@@ -10,6 +10,8 @@ from models.user_models import User
 import requests
 import time
 from jose import jwt, JWTError
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_auth_requests
 
 # Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -22,6 +24,9 @@ AZURE_TENANT_ID = os.environ.get('AZURE_TENANT_ID')
 AZURE_CLIENT_ID = os.environ.get('AZURE_BACKEND_CLIENT_ID')
 AZURE_CLIENT_SECRET = os.environ.get('AZURE_CLIENT_SECRET')
 JWKS_URL = f"https://login.microsoftonline.com/{AZURE_TENANT_ID}/discovery/v2.0/keys" if AZURE_TENANT_ID else None
+
+# Google OAuth configuration
+GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID')
 
 # JWKS cache
 jwks_cache = {"keys": None, "last_updated": 0}
@@ -149,3 +154,20 @@ def verify_azure_token(token: str):
     except Exception as e:
         logging.error(f"Unexpected error during token verification: {str(e)}")
         raise HTTPException(status_code=401, detail="Token verification failed")
+
+def verify_google_token(token: str) -> dict:
+    """Verify and decode a Google OAuth ID token"""
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=503, detail="Google authentication not configured")
+    try:
+        idinfo = id_token.verify_oauth2_token(
+            token,
+            google_auth_requests.Request(),
+            GOOGLE_CLIENT_ID
+        )
+        if idinfo['iss'] not in ['accounts.google.com', 'https://accounts.google.com']:
+            raise HTTPException(status_code=401, detail="Invalid token issuer")
+        return idinfo
+    except ValueError as e:
+        logging.error(f"Google token verification failed: {str(e)}")
+        raise HTTPException(status_code=401, detail="Invalid Google token")

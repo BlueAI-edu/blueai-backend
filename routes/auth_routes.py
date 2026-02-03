@@ -5,7 +5,7 @@ import uuid
 import secrets
 import logging
 from models.user_models import User, UserRegister, UserLogin, PasswordReset, PasswordResetConfirm, UpdateProfile
-from services.auth_service import hash_password, verify_password, send_reset_email, verify_azure_token
+from services.auth_service import hash_password, verify_password, send_reset_email, verify_azure_token, verify_google_token
 from utils.database import db
 from utils.dependencies import get_current_user
 
@@ -377,6 +377,123 @@ async def microsoft_auth(request: Request, response: Response):
         raise
     except Exception as e:
         logging.error(f"Microsoft authentication error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Authentication failed")
+
+@router.post("/google", response_model=User)
+async def google_auth(request: Request, response: Response):
+    """Authenticate with Google OAuth - accepts Google ID token"""
+    try:
+        # Get token from Authorization header
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No token provided")
+
+        token = auth_header.split(" ")[1]
+
+        # Verify the Google ID token
+        payload = verify_google_token(token)
+
+        # Extract user information
+        email = payload.get("email")
+        name = payload.get("name", "Unknown User")
+        picture = payload.get("picture")
+
+        if not email:
+            raise HTTPException(status_code=400, detail="Email not found in token")
+
+        if not payload.get("email_verified"):
+            raise HTTPException(status_code=400, detail="Email not verified by Google")
+
+        # Check if user exists
+        existing_user = await db.users.find_one({"email": email}, {"_id": 0})
+
+        if existing_user:
+            # Update last login and auth provider info
+            await db.users.update_one(
+                {"email": email},
+                {
+                    "$set": {
+                        "last_login": datetime.now(timezone.utc),
+                        "auth_provider": "google",
+                        "picture": picture
+                    }
+                }
+            )
+
+            # Create session
+            session_token = secrets.token_urlsafe(32)
+            expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+            await db.user_sessions.insert_one({
+                "user_id": existing_user["user_id"],
+                "session_token": session_token,
+                "expires_at": expires_at.isoformat(),
+                "created_at": datetime.now(timezone.utc).isoformat()
+            })
+
+            # Set httpOnly cookie
+            response.set_cookie(
+                key="session_token",
+                value=session_token,
+                httponly=True,
+                secure=True,
+                samesite="none",
+                path="/",
+                max_age=30*24*60*60
+            )
+
+            # Parse created_at if it's a string
+            if isinstance(existing_user.get('created_at'), str):
+                existing_user['created_at'] = datetime.fromisoformat(existing_user['created_at'])
+
+            logging.info(f"Google user logged in: {email}")
+
+            return User(**existing_user)
+        else:
+            # Create new user
+            user_id = str(uuid.uuid4())
+            new_user = {
+                "user_id": user_id,
+                "email": email,
+                "name": name,
+                "role": "teacher",
+                "auth_provider": "google",
+                "picture": picture,
+                "display_name": name,
+                "created_at": datetime.now(timezone.utc),
+                "last_login": datetime.now(timezone.utc)
+            }
+
+            await db.users.insert_one(new_user)
+
+            # Create session
+            session_token = secrets.token_urlsafe(32)
+            expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+            await db.user_sessions.insert_one({
+                "user_id": user_id,
+                "session_token": session_token,
+                "expires_at": expires_at.isoformat(),
+                "created_at": datetime.now(timezone.utc).isoformat()
+            })
+
+            # Set httpOnly cookie
+            response.set_cookie(
+                key="session_token",
+                value=session_token,
+                httponly=True,
+                secure=True,
+                samesite="none",
+                path="/",
+                max_age=30*24*60*60
+            )
+
+            logging.info(f"Created new Google user: {email}")
+
+            return User(**new_user)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Google authentication error: {str(e)}")
         raise HTTPException(status_code=500, detail="Authentication failed")
 
 @router.put("/profile", response_model=User)

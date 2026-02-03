@@ -32,6 +32,8 @@ from jose import jwt, JWTError
 import requests
 import time
 from functools import lru_cache
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_auth_requests
 from fastapi import UploadFile, File
 import sys
 
@@ -88,6 +90,9 @@ AZURE_TENANT_ID = os.environ.get('AZURE_TENANT_ID')
 AZURE_CLIENT_ID = os.environ.get('AZURE_BACKEND_CLIENT_ID')
 AZURE_CLIENT_SECRET = os.environ.get('AZURE_CLIENT_SECRET')
 JWKS_URL = f"https://login.microsoftonline.com/{AZURE_TENANT_ID}/discovery/v2.0/keys" if AZURE_TENANT_ID else None
+
+# Google OAuth configuration
+GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID')
 
 # JWKS cache
 jwks_cache = {"keys": None, "last_updated": 0}
@@ -1207,7 +1212,139 @@ async def microsoft_auth(request: Request, response: Response):
         logging.error(f"Microsoft authentication error: {str(e)}")
         raise HTTPException(status_code=500, detail="Authentication failed")
 
+def verify_google_token(token: str) -> dict:
+    """Verify and decode a Google OAuth ID token"""
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=503, detail="Google authentication not configured")
+    try:
+        idinfo = id_token.verify_oauth2_token(
+            token,
+            google_auth_requests.Request(),
+            GOOGLE_CLIENT_ID
+        )
+        if idinfo['iss'] not in ['accounts.google.com', 'https://accounts.google.com']:
+            raise HTTPException(status_code=401, detail="Invalid token issuer")
+        return idinfo
+    except ValueError as e:
+        logging.error(f"Google token verification failed: {str(e)}")
+        raise HTTPException(status_code=401, detail="Invalid Google token")
 
+@api_router.post("/auth/google", response_model=User)
+async def google_auth(request: Request, response: Response):
+    """Authenticate with Google OAuth - accepts Google ID token"""
+    try:
+        # Get token from Authorization header
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No token provided")
+
+        token = auth_header.split(" ")[1]
+
+        # Verify the Google ID token
+        payload = verify_google_token(token)
+
+        # Extract user information
+        email = payload.get("email")
+        name = payload.get("name", "Unknown User")
+        picture = payload.get("picture")
+
+        if not email:
+            raise HTTPException(status_code=400, detail="Email not found in token")
+
+        if not payload.get("email_verified"):
+            raise HTTPException(status_code=400, detail="Email not verified by Google")
+
+        # Check if user exists
+        existing_user = await db.users.find_one({"email": email}, {"_id": 0})
+
+        if existing_user:
+            # Update last login and auth provider info
+            await db.users.update_one(
+                {"email": email},
+                {
+                    "$set": {
+                        "last_login": datetime.now(timezone.utc),
+                        "auth_provider": "google",
+                        "picture": picture
+                    }
+                }
+            )
+
+            # Create session
+            session_token = secrets.token_urlsafe(32)
+            expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+            await db.user_sessions.insert_one({
+                "user_id": existing_user["user_id"],
+                "session_token": session_token,
+                "expires_at": expires_at.isoformat(),
+                "created_at": datetime.now(timezone.utc).isoformat()
+            })
+
+            # Set httpOnly cookie
+            response.set_cookie(
+                key="session_token",
+                value=session_token,
+                httponly=True,
+                secure=True,
+                samesite="none",
+                path="/",
+                max_age=30*24*60*60
+            )
+
+            # Parse created_at if it's a string
+            if isinstance(existing_user.get('created_at'), str):
+                existing_user['created_at'] = datetime.fromisoformat(existing_user['created_at'])
+
+            logging.info(f"Google user logged in: {email}")
+
+            return User(**existing_user)
+        else:
+            # Create new user
+            user_id = str(uuid.uuid4())
+            new_user = {
+                "user_id": user_id,
+                "email": email,
+                "name": name,
+                "role": "teacher",
+                "auth_provider": "google",
+                "picture": picture,
+                "display_name": name,
+                "created_at": datetime.now(timezone.utc),
+                "last_login": datetime.now(timezone.utc)
+            }
+
+            await db.users.insert_one(new_user)
+
+            # Create session
+            session_token = secrets.token_urlsafe(32)
+            expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+            await db.user_sessions.insert_one({
+                "user_id": user_id,
+                "session_token": session_token,
+                "expires_at": expires_at.isoformat(),
+                "created_at": datetime.now(timezone.utc).isoformat()
+            })
+
+            # Set httpOnly cookie
+            response.set_cookie(
+                key="session_token",
+                value=session_token,
+                httponly=True,
+                secure=True,
+                samesite="none",
+                path="/",
+                max_age=30*24*60*60
+            )
+
+            logging.info(f"Created new Google user: {email}")
+
+            return User(**new_user)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Google authentication error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Authentication failed")
 
 @api_router.put("/auth/profile", response_model=User)
 async def update_profile(profile_data: UpdateProfile, user: User = Depends(get_current_user)):
