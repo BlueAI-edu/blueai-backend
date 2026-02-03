@@ -73,7 +73,7 @@ UPLOAD_DIR = ROOT_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 # MongoDB connection
-mongo_url = os.environ['MONGO_URL']
+mongo_url = os.environ['MONGO_URL'].strip()
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
