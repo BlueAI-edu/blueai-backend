@@ -51,6 +51,7 @@ from services.analytics_service import AnalyticsService
 
 # Import modular routes
 from routes.classes_routes import router as classes_router
+from routes.auth_routes import router as auth_router
 
 # Import models
 from models.assessment_models import (
@@ -85,91 +86,8 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # Email configuration
 resend.api_key = os.environ.get('RESEND_API_KEY')
 
-# Azure AD configuration
-AZURE_TENANT_ID = os.environ.get('AZURE_TENANT_ID')
-AZURE_CLIENT_ID = os.environ.get('AZURE_BACKEND_CLIENT_ID')
-AZURE_CLIENT_SECRET = os.environ.get('AZURE_CLIENT_SECRET')
-JWKS_URL = f"https://login.microsoftonline.com/{AZURE_TENANT_ID}/discovery/v2.0/keys" if AZURE_TENANT_ID else None
-
 # Google OAuth configuration
 GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID')
-
-# JWKS cache
-jwks_cache = {"keys": None, "last_updated": 0}
-JWKS_CACHE_TTL = 3600  # 1 hour
-
-def get_jwks():
-    """Fetch and cache JWKS from Azure AD"""
-    current_time = time.time()
-    if jwks_cache["keys"] is None or (current_time - jwks_cache["last_updated"]) > JWKS_CACHE_TTL:
-        try:
-            response = requests.get(JWKS_URL, timeout=10)
-            response.raise_for_status()
-            jwks_cache["keys"] = response.json()
-            jwks_cache["last_updated"] = current_time
-            logging.info("Successfully fetched JWKS from Azure AD")
-        except Exception as e:
-            logging.error(f"Failed to fetch JWKS: {str(e)}")
-            if jwks_cache["keys"] is None:
-                raise HTTPException(status_code=503, detail="Authentication service unavailable")
-    return jwks_cache["keys"]
-
-def verify_azure_token(token: str):
-    """Verify and decode Azure AD access token"""
-    try:
-        # Get the token header to find the key ID
-        header = jwt.get_unverified_header(token)
-        kid = header.get("kid")
-        
-        if not kid:
-            raise HTTPException(status_code=401, detail="Token missing key ID")
-        
-        # Get JWKS and find the matching key
-        jwks = get_jwks()
-        key = None
-        for k in jwks.get("keys", []):
-            if k.get("kid") == kid:
-                key = k
-                break
-        
-        if not key:
-            raise HTTPException(status_code=401, detail="Unable to find appropriate signing key")
-        
-        # Convert JWK to PEM format
-        from cryptography.hazmat.primitives.asymmetric import rsa
-        from cryptography.hazmat.primitives import serialization
-        import base64
-        
-        def base64_to_long(data: str) -> int:
-            if isinstance(data, str):
-                data = data.encode("ascii")
-            decoded = base64.urlsafe_b64decode(data + b"==")
-            return int.from_bytes(decoded, byteorder="big")
-        
-        n = base64_to_long(key['n'])
-        e = base64_to_long(key['e'])
-        public_key = rsa.RSAPublicNumbers(e, n).public_key()
-        pem = public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        )
-        
-        # Verify and decode the token
-        payload = jwt.decode(
-            token,
-            pem,
-            algorithms=["RS256"],
-            audience=AZURE_CLIENT_ID,
-            options={"verify_exp": True}
-        )
-        
-        return payload
-    except JWTError as e:
-        logging.error(f"Token verification failed: {str(e)}")
-        raise HTTPException(status_code=401, detail="Invalid token")
-    except Exception as e:
-        logging.error(f"Unexpected error during token verification: {str(e)}")
-        raise HTTPException(status_code=401, detail="Token verification failed")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -183,6 +101,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 api_router = APIRouter(prefix="/api")
+
+# Include auth routes
+api_router.include_router(auth_router)
 
 # Health check endpoint (required for deployment)
 @app.get("/health")
@@ -1097,120 +1018,6 @@ async def reset_password(reset_data: PasswordResetConfirm):
     await db.user_sessions.delete_many({"user_id": reset_doc["user_id"]})
     
     return {"message": "Password reset successfully"}
-
-@api_router.post("/auth/microsoft", response_model=User)
-async def microsoft_auth(request: Request, response: Response):
-    """Authenticate with Microsoft OAuth - accepts Azure AD access token"""
-    try:
-        # Get token from Authorization header
-        auth_header = request.headers.get("Authorization")
-        if not auth_header or not auth_header.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="No token provided")
-        
-        token = auth_header.split(" ")[1]
-        
-        # Verify the Azure AD token
-        payload = verify_azure_token(token)
-        
-        # Extract user information
-        email = payload.get("email") or payload.get("upn") or payload.get("preferred_username")
-        name = payload.get("name", "Unknown User")
-        tenant_id = payload.get("tid")
-        
-        if not email:
-            raise HTTPException(status_code=400, detail="Email not found in token")
-        
-        # Check if user exists
-        existing_user = await db.users.find_one({"email": email}, {"_id": 0})
-        
-        if existing_user:
-            # Update last login and auth provider info
-            await db.users.update_one(
-                {"email": email},
-                {
-                    "$set": {
-                        "last_login": datetime.now(timezone.utc),
-                        "auth_provider": "microsoft",
-                        "tenant_id": tenant_id
-                    }
-                }
-            )
-            
-            # Create session
-            session_token = secrets.token_urlsafe(32)
-            expires_at = datetime.now(timezone.utc) + timedelta(days=30)
-            await db.user_sessions.insert_one({
-                "user_id": existing_user["user_id"],
-                "session_token": session_token,
-                "expires_at": expires_at.isoformat(),
-                "created_at": datetime.now(timezone.utc).isoformat()
-            })
-            
-            # Set httpOnly cookie
-            response.set_cookie(
-                key="session_token",
-                value=session_token,
-                httponly=True,
-                secure=True,
-                samesite="none",
-                path="/",
-                max_age=30*24*60*60
-            )
-            
-            # Parse created_at if it's a string
-            if isinstance(existing_user.get('created_at'), str):
-                existing_user['created_at'] = datetime.fromisoformat(existing_user['created_at'])
-            
-            logging.info(f"Microsoft user logged in: {email}")
-            
-            return User(**existing_user)
-        else:
-            # Create new user
-            user_id = str(uuid.uuid4())
-            new_user = {
-                "user_id": user_id,
-                "email": email,
-                "name": name,
-                "role": "teacher",
-                "auth_provider": "microsoft",
-                "tenant_id": tenant_id,
-                "display_name": name,
-                "created_at": datetime.now(timezone.utc),
-                "last_login": datetime.now(timezone.utc)
-            }
-            
-            await db.users.insert_one(new_user)
-            
-            # Create session
-            session_token = secrets.token_urlsafe(32)
-            expires_at = datetime.now(timezone.utc) + timedelta(days=30)
-            await db.user_sessions.insert_one({
-                "user_id": user_id,
-                "session_token": session_token,
-                "expires_at": expires_at.isoformat(),
-                "created_at": datetime.now(timezone.utc).isoformat()
-            })
-            
-            # Set httpOnly cookie
-            response.set_cookie(
-                key="session_token",
-                value=session_token,
-                httponly=True,
-                secure=True,
-                samesite="none",
-                path="/",
-                max_age=30*24*60*60
-            )
-            
-            logging.info(f"Created new Microsoft user: {email}")
-            
-            return User(**new_user)
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"Microsoft authentication error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Authentication failed")
 
 def verify_google_token(token: str) -> dict:
     """Verify and decode a Google OAuth ID token"""

@@ -147,6 +147,12 @@ def verify_azure_token(token: str):
             options={"verify_exp": True}
         )
         
+        # Validate issuer
+        expected_iss = f"https://login.microsoftonline.com/{payload.get('tid')}/v2.0" if payload.get('tid') else None
+        if expected_iss and payload.get('iss') != expected_iss:
+            logging.error(f"Invalid token issuer: expected {expected_iss}, got {payload.get('iss')}")
+            raise HTTPException(status_code=401, detail="Invalid token issuer")
+        
         return payload
     except JWTError as e:
         logging.error(f"Token verification failed: {str(e)}")
