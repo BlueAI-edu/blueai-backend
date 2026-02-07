@@ -12,7 +12,7 @@ from typing import List, Optional
 from contextlib import asynccontextmanager
 import uuid
 from datetime import datetime, timezone, timedelta
-# from emergentintegrations.llm.chat import LlmChat, UserMessage
+import openai
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, ListFlowable, ListItem
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -65,9 +65,16 @@ from models.assessment_models import (
 # Import OCR service with error handling
 try:
     from ocr_service import ocr_service, OCRResult
-    OCR_AVAILABLE = True
+    OCR_AVAILABLE = ocr_service.is_configured()
+    if not OCR_AVAILABLE:
+        logging.warning("OCR service loaded but Azure is not configured. "
+                       "Set AZURE_VISION_ENDPOINT and AZURE_VISION_KEY in .env")
 except ImportError as e:
     logging.warning(f"OCR service not available: {str(e)}")
+    OCR_AVAILABLE = False
+    ocr_service = None
+except Exception as e:
+    logging.error(f"OCR service initialization failed: {str(e)}")
     OCR_AVAILABLE = False
     ocr_service = None
 
@@ -97,6 +104,8 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown
     logger.info("Application shutting down...")
+    if OCR_AVAILABLE and ocr_service:
+        await ocr_service.close()
     client.close()
 
 app = FastAPI(lifespan=lifespan)
@@ -1868,6 +1877,17 @@ async def rollback_migration(assessment_id: str, user: User = Depends(require_te
 
 # ==================== OCR ENDPOINTS (Phase 2) ====================
 
+@api_router.get("/ocr/status")
+async def ocr_status():
+    """Check OCR service configuration status"""
+    return {
+        "ocr_available": OCR_AVAILABLE,
+        "azure_configured": ocr_service.is_configured() if ocr_service else False,
+        "azure_endpoint_set": bool(os.getenv("AZURE_VISION_ENDPOINT")),
+        "azure_key_set": bool(os.getenv("AZURE_VISION_KEY")),
+        "openai_key_set": bool(os.getenv("OPENAI_API_KEY")),
+    }
+
 @api_router.post("/ocr/submissions")
 async def create_ocr_submission(
     submission_data: OCRSubmissionCreate,
@@ -1912,29 +1932,40 @@ async def upload_ocr_files(
     if submission["owner_teacher_id"] != user.user_id and user.role != "admin":
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    # Check OCR configuration (Azure credentials issue - temporarily disabled)
-    ocr_configured = False
-    logging.warning("Azure OCR temporarily disabled - please update Azure credentials")
-    
     # Create submission directory
     submission_dir = UPLOAD_DIR / submission_id
     submission_dir.mkdir(exist_ok=True)
     
+    ALLOWED_EXTENSIONS = {'.pdf', '.jpg', '.jpeg', '.png', '.tiff', '.bmp'}
+    MAX_FILE_SIZE_MB = 50
+
     saved_files = []
     file_type = "images"
-    
+
     for idx, file in enumerate(files):
-        # Save file
         file_ext = Path(file.filename).suffix.lower()
+        if file_ext not in ALLOWED_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type: {file_ext}. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
+            )
+
+        content = await file.read()
+
+        file_size_mb = len(content) / (1024 * 1024)
+        if file_size_mb > MAX_FILE_SIZE_MB:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File {file.filename} is {file_size_mb:.1f}MB, exceeds {MAX_FILE_SIZE_MB}MB limit"
+            )
+
         if file_ext == '.pdf':
             file_type = "pdf"
-        
+
         file_path = submission_dir / f"page_{idx+1}{file_ext}"
-        
         with open(file_path, "wb") as f:
-            content = await file.read()
             f.write(content)
-        
+
         saved_files.append(str(file_path))
     
     # Update submission with file info
@@ -2117,8 +2148,11 @@ async def mark_ocr_submission(
     assessment = await db.assessments.find_one({"id": submission["assessment_id"]}, {"_id": 0})
     question = await db.questions.find_one({"id": assessment["question_id"]}, {"_id": 0})
     
-    # Mark using AI (same as regular marking)
-    api_key = os.environ.get('EMERGENT_LLM_KEY')
+    # Mark using AI
+    api_key = os.environ.get('OPENAI_API_KEY')
+    if not api_key:
+        raise HTTPException(status_code=503, detail="AI marking not configured - OPENAI_API_KEY missing")
+
     marking_prompt = f"""You are an expert examiner. Mark conservatively and fairly.
 
 Subject: {question['subject']}
@@ -2141,20 +2175,23 @@ SCORE: [number]
 WWW: Point 1; Point 2; Point 3
 NEXT_STEPS: Step 1; Step 2; Step 3
 FEEDBACK: [paragraph]"""
-    
-    # chat = LlmChat(
-    #     api_key=api_key,
-    #     session_id=f"ocr_marking_{submission_id}",
-    #     system_message="You are a supportive examiner providing constructive feedback."
-    # ).with_model("openai", "gpt-4o")
-    
-    # response = await chat.send_message(UserMessage(text=marking_prompt))
-    
-    # Extract text from response
-    # response_text = response if isinstance(response, str) else str(response)
-    response_text = f"SCORE: 7\nWWW: Good attempt; Clear structure; Relevant content\nNEXT_STEPS: Review topic; Practice more; Seek help\nFEEDBACK: Good effort on this question."
 
-    
+    try:
+        client = openai.AsyncOpenAI(api_key=api_key)
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are a supportive examiner providing constructive feedback."},
+                {"role": "user", "content": marking_prompt}
+            ],
+            temperature=0.3,
+            max_tokens=1000
+        )
+        response_text = response.choices[0].message.content
+    except Exception as e:
+        logging.error(f"AI marking failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"AI marking failed: {str(e)}")
+
     # Parse response
     score = 0
     www = ""

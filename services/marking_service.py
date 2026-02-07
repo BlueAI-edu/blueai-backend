@@ -1,7 +1,7 @@
 import os
 import logging
 import json
-# from emergentintegrations.llm.chat import LlmChat, UserMessage
+import openai
 
 async def get_example_answers(db, question_id: str, teacher_owner_id: str) -> dict:
     """Get example answers for a question"""
@@ -50,7 +50,7 @@ def format_examples_for_prompt(examples: dict, max_marks: int) -> str:
 
 async def mark_submission_enhanced(question: dict, student_name: str, answer_text: str, attempt_id: str, examples: dict = None) -> dict:
     """Enhanced marking with detailed breakdown, confidence scores, and review flags"""
-    api_key = os.environ.get('EMERGENT_LLM_KEY')
+    api_key = os.environ.get('OPENAI_API_KEY')
     
     # Format examples if provided
     examples_section = ""
@@ -117,17 +117,32 @@ WWW: [Point 1; Point 2; Point 3]
 NEXT_STEPS: [Step 1; Step 2; Step 3]
 FEEDBACK: [paragraph]"""
     
-    # chat = LlmChat(
-    #     api_key=api_key,
-    #     session_id=f"marking_enhanced_{attempt_id}",
-    #     system_message="You are a meticulous examiner who provides detailed, fair marking with clear justifications."
-    # ).with_model("openai", "gpt-4o")
-    
-    # response = await chat.send_message(UserMessage(text=marking_prompt))
-    
-    # Mock response for now
-    response = f"SCORE: 7\nWWW: Good attempt; Clear structure; Relevant content\nNEXT_STEPS: Review topic; Practice more; Seek help\nFEEDBACK: Good effort on this question.\nAI_CONFIDENCE: 0.8"
-    
+    if not api_key:
+        logging.error("OPENAI_API_KEY not set - AI marking unavailable")
+        return {
+            "score": 0, "www": "", "next_steps": "", "overall_feedback": "AI marking unavailable - OPENAI_API_KEY not configured",
+            "mark_breakdown": [], "needs_review": True, "review_reasons": ["AI marking unavailable"], "ai_confidence": 0.0
+        }
+
+    try:
+        client = openai.AsyncOpenAI(api_key=api_key)
+        llm_response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are a meticulous examiner who provides detailed, fair marking with clear justifications."},
+                {"role": "user", "content": marking_prompt}
+            ],
+            temperature=0.3,
+            max_tokens=2000
+        )
+        response = llm_response.choices[0].message.content
+    except Exception as e:
+        logging.error(f"AI marking failed: {str(e)}")
+        return {
+            "score": 0, "www": "", "next_steps": "", "overall_feedback": f"AI marking failed: {str(e)}",
+            "mark_breakdown": [], "needs_review": True, "review_reasons": [f"AI error: {str(e)}"], "ai_confidence": 0.0
+        }
+
     # Parse response
     result = {
         "score": 0,
@@ -139,9 +154,6 @@ FEEDBACK: [paragraph]"""
         "review_reasons": [],
         "ai_confidence": 0.5
     }
-    
-    current_key = None
-    current_value = []
     
     for line in response.split('\n'):
         line = line.strip()
