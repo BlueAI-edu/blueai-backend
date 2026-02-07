@@ -1888,6 +1888,42 @@ async def ocr_status():
         "openai_key_set": bool(os.getenv("OPENAI_API_KEY")),
     }
 
+@api_router.get("/ocr/submissions/{submission_id}/image/{page_number}")
+async def get_ocr_image(
+    submission_id: str,
+    page_number: int,
+    user: User = Depends(get_current_user)
+):
+    """Serve uploaded OCR image for preview"""
+    submission = await db.ocr_submissions.find_one({"id": submission_id}, {"_id": 0})
+    if not submission or (submission["owner_teacher_id"] != user.user_id and user.role != "admin"):
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    page = await db.ocr_pages.find_one(
+        {"submission_id": submission_id, "page_number": page_number}, {"_id": 0}
+    )
+    if not page:
+        raise HTTPException(status_code=404, detail="Page not found")
+
+    file_path = Path(page["file_path"])
+    if not file_path.exists():
+        # Fallback: try finding the file in the uploads directory
+        submission_dir = UPLOAD_DIR / submission_id
+        possible_files = sorted(submission_dir.glob(f"page_{page_number}.*")) if submission_dir.exists() else []
+        if possible_files:
+            file_path = possible_files[0]
+        else:
+            raise HTTPException(status_code=404, detail="Image file not found")
+
+    ext = file_path.suffix.lower()
+    media_types = {
+        '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+        '.tiff': 'image/tiff', '.bmp': 'image/bmp', '.pdf': 'application/pdf'
+    }
+    media_type = media_types.get(ext, 'application/octet-stream')
+
+    return FileResponse(str(file_path), media_type=media_type)
+
 @api_router.post("/ocr/submissions")
 async def create_ocr_submission(
     submission_data: OCRSubmissionCreate,
