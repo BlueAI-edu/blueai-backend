@@ -23,7 +23,7 @@ resend.api_key = os.environ.get('RESEND_API_KEY')
 AZURE_TENANT_ID = os.environ.get('AZURE_TENANT_ID')
 AZURE_CLIENT_ID = os.environ.get('AZURE_BACKEND_CLIENT_ID')
 AZURE_CLIENT_SECRET = os.environ.get('AZURE_CLIENT_SECRET')
-JWKS_URL = f"https://login.microsoftonline.com/{AZURE_TENANT_ID}/discovery/v2.0/keys" if AZURE_TENANT_ID else None
+JWKS_URL = "https://login.microsoftonline.com/common/discovery/v2.0/keys"
 
 # Google OAuth configuration
 GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID')
@@ -147,10 +147,11 @@ def verify_azure_token(token: str):
             options={"verify_exp": True}
         )
         
-        # Validate issuer
-        expected_iss = f"https://login.microsoftonline.com/{payload.get('tid')}/v2.0" if payload.get('tid') else None
-        if expected_iss and payload.get('iss') != expected_iss:
-            logging.error(f"Invalid token issuer: expected {expected_iss}, got {payload.get('iss')}")
+        # Validate issuer format for v2.0 tokens
+        iss = payload.get('iss', '')
+        tid = payload.get('tid', '')
+        if not tid or iss != f"https://login.microsoftonline.com/{tid}/v2.0":
+            logging.error(f"Invalid token issuer: {iss}")
             raise HTTPException(status_code=401, detail="Invalid token issuer")
         
         return payload
