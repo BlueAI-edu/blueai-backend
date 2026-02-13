@@ -2251,6 +2251,7 @@ FEEDBACK: [paragraph]"""
     # Save marking result
     marking_result = {
         "submission_id": submission_id,
+        "answer_text": combined_text,
         "total_score": score,
         "max_marks": question['max_marks'],
         "www": www,
@@ -2351,6 +2352,7 @@ async def finalize_submission(
         "student_name": submission["student_name"],
         "assessment_id": submission["assessment_id"],
         "owner_teacher_id": submission["owner_teacher_id"],
+        "answer_text": marking_result.get("answer_text", ""),
         "score": marking_result["total_score"],
         "www": marking_result["www"],
         "next_steps": marking_result["next_steps"],
