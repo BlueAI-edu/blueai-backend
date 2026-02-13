@@ -494,6 +494,9 @@ async def generate_feedback_pdf(attempt_doc: dict, teacher_display: str, teacher
     pdf_filename = f"{safe_student_name}_{safe_subject}_Feedback_{attempt_identifier[:8]}.pdf"
     pdf_path = Path(ROOT_DIR) / "generated_pdfs" / pdf_filename
     
+    # Create directory if it doesn't exist
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+    
     # Generate PDF with A4 size and 25mm margins
     doc = SimpleDocTemplate(
         str(pdf_path),
