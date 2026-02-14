@@ -2383,6 +2383,47 @@ async def finalize_submission(
     
     return {"message": "Submission finalized", "pdf_url": pdf_filename}
 
+@api_router.get("/ocr/submissions/{submission_id}/download-pdf")
+async def download_ocr_pdf(
+    submission_id: str,
+    user: User = Depends(get_current_user)
+):
+    """Download feedback PDF for an OCR submission"""
+    # Get marking result to find PDF filename
+    marking_result = await db.ocr_marking_results.find_one(
+        {"submission_id": submission_id}, 
+        {"_id": 0}
+    )
+    if not marking_result:
+        raise HTTPException(status_code=404, detail="Marking result not found")
+    
+    # Get submission to verify ownership
+    submission = await db.ocr_submissions.find_one(
+        {"id": submission_id}, 
+        {"_id": 0}
+    )
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    
+    # Check authorization
+    if submission["owner_teacher_id"] != user.user_id and user.role != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    # Check if PDF exists
+    pdf_filename = marking_result.get("pdf_url")
+    if not pdf_filename:
+        raise HTTPException(status_code=404, detail="PDF not generated yet")
+    
+    pdf_path = Path(ROOT_DIR) / "generated_pdfs" / pdf_filename
+    if not pdf_path.exists():
+        raise HTTPException(status_code=404, detail="PDF file not found")
+    
+    return FileResponse(
+        str(pdf_path),
+        media_type='application/pdf',
+        filename=pdf_filename
+    )
+
 @api_router.get("/ocr/submissions")
 async def list_ocr_submissions(
     assessment_id: Optional[str] = None,
