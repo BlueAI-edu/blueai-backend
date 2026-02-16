@@ -2130,7 +2130,7 @@ async def update_ocr_page(
         }}
     )
     
-    if result.modified_count == 0:
+    if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Page not found")
     
     return {"message": "Page updated successfully"}
